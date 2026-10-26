@@ -1,274 +1,241 @@
 # Infrastructure as Code Lab on AWS
 
-> This README was generated with [Claude](https://claude.ai) by Anthropic.
+> This README was generated with [Claude] as per my command.
 
-A small, end-to-end DevOps lab:
+An end-to-end DevOps project that builds AWS infrastructure from code, configures it automatically and deploys a containerized web app through a CI/CD pipeline with a security gate. The whole environment can be created and torn down with one pipeline run.
 
-- **Terraform** creates an EC2 server, a security group and a private S3 bucket on AWS.
-- **Ansible** installs Docker on the new server and deploys the app container.
-- **Jenkins** runs everything in one pipeline: tests, Docker build, **Trivy** security scan, push to Docker Hub, Terraform, Ansible and a smoke test.
-- **Kubernetes (minikube)** runs the same container locally with a Deployment and a Service.
+## Highlights
 
+- **Infrastructure as code:** Terraform creates an EC2 server, a security group, an SSH key pair and a private, encrypted S3 bucket.
+- **Configuration management:** Ansible installs Docker on the new server and deploys the app container.
+- **CI/CD:** a Jenkins pipeline runs unit tests, builds the image, scans it, pushes it to Docker Hub, provisions AWS and deploys, then checks the app's health endpoint.
+- **Security gate:** Trivy scans every image and stops the pipeline on critical vulnerabilities, so an insecure image never reaches the server.
+- **Kubernetes:** the same container runs on a local minikube cluster with a Deployment (2 replicas, health probes, resource limits) and a NodePort Service.
+- **Secure defaults:** SSH only from your own IP, IMDSv2 enforced, encrypted disk, S3 public access blocked, no secrets in the repo.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    dev[Developer] -->|git push| gh[GitHub]
+    gh --> jenkins[Jenkins]
+
+    subgraph pipeline[Jenkins pipeline]
+        direction TB
+        t[Unit tests] --> b[Docker build] --> s[Trivy scan]
+        s -->|no CRITICAL| p[Push to Docker Hub]
+        p --> tf[Terraform apply] --> an[Ansible: install Docker + deploy] --> st[Smoke test /health]
+    end
+
+    jenkins --> pipeline
+    s -.->|CRITICAL found| stop((Pipeline stops))
+    tf --> aws
+    an --> ec2
+
+    subgraph aws[AWS eu-central-1]
+        ec2[EC2 t3.micro<br/>Docker container on port 80]
+        sg[Security group]
+        s3[(S3 bucket)]
+    end
+
+    hub[(Docker Hub)] -->|docker pull| ec2
+    p --> hub
 ```
- git push ──► Jenkins (on your laptop)
-                │
-                ├─ pytest
-                ├─ docker build
-                ├─ Trivy scan ── CRITICAL found? ──► pipeline stops
-                ├─ docker push ──► Docker Hub
-                ├─ terraform apply ──► AWS: EC2 + security group + S3
-                ├─ ansible: install Docker on EC2
-                ├─ ansible: run container (port 80)
-                └─ curl /health ──► ✅ http://<EC2-IP>
-```
 
-## Folder structure
+## Tech stack
 
-| Folder / file | What it does |
+| Area | Tools |
 |---|---|
-| `app/` | Tiny Python Flask web app with a `/health` endpoint, unit tests and a `Dockerfile` |
-| `terraform/` | AWS infrastructure: EC2, security group, SSH key, S3 bucket. Also writes the Ansible inventory |
-| `ansible/` | `install-docker.yml` prepares the server, `deploy-app.yml` runs the container |
-| `Jenkinsfile` | The CI/CD pipeline (with the Trivy scan stage) |
-| `jenkins/` | `Dockerfile` + `docker-compose.yml` that start a Jenkins with Terraform, Ansible and Docker already installed |
-| `k8s/` | Kubernetes Deployment and Service for minikube |
+| Cloud | AWS (EC2, S3, IAM, VPC, security groups) |
+| Infrastructure as code | Terraform |
+| Configuration management | Ansible |
+| CI/CD | Jenkins (declarative pipeline), Git, GitHub |
+| Containers | Docker, Docker Hub |
+| Security | Trivy image scanning |
+| Orchestration | Kubernetes (minikube) |
+| Application | Python, Flask, Gunicorn, pytest |
 
----
+## Pipeline stages
 
-## 0. What you need
-
-| Tool | Why | Install |
+| # | Stage | What happens |
 |---|---|---|
-| Docker Desktop (or Docker Engine on Linux) | Runs Jenkins, builds images | https://docs.docker.com/get-docker/ |
-| An AWS account | Where the server runs | https://aws.amazon.com/free/ |
-| A Docker Hub account (free) | Stores the image so the server can pull it | https://hub.docker.com/ |
-| A GitHub account | Jenkins pulls the code from your repo | https://github.com/ |
-| Terraform, Ansible (optional) | Only for Part A (manual run). Jenkins already has them | https://developer.hashicorp.com/terraform/install, `pip install ansible` |
-| minikube + kubectl | Part C, local Kubernetes | https://minikube.sigs.k8s.io/docs/start/ |
+| 1 | Unit tests | `pytest` runs the app tests |
+| 2 | Build image | Docker builds the image for `linux/amd64`, tagged with the build number |
+| 3 | Security scan | Trivy fails the build on CRITICAL vulnerabilities that have a fix |
+| 4 | Push image | Image is pushed to Docker Hub |
+| 5 | Terraform | Creates or updates the AWS resources (or destroys them with `ACTION=destroy`) |
+| 6 | Ansible: install Docker | Prepares the fresh Ubuntu server |
+| 7 | Ansible: deploy app | Pulls the new image and restarts the container |
+| 8 | Smoke test | Calls `/health` on the public URL |
 
-> **Windows:** run the commands in WSL2 (Ubuntu). Ansible does not run natively on Windows.
+## Repository structure
+
+```
+iac-lab/
+├── app/                    Flask app, unit tests, Dockerfile
+├── terraform/              EC2, security group, key pair, S3 bucket, outputs
+├── ansible/                install-docker.yml, deploy-app.yml
+├── k8s/                    Deployment and Service for minikube
+├── jenkins/                Dockerfile + docker-compose.yml for a ready-to-use Jenkins
+└── Jenkinsfile             CI/CD pipeline
+```
 
 ---
 
-## 1. One-time setup
+## Getting started
 
-### 1.1 Create an AWS user for the lab (don't use the root account)
+### Prerequisites
 
-1. AWS Console → **IAM → Users → Create user**, name it `iac-lab`.
-2. Attach the policies **AmazonEC2FullAccess** and **AmazonS3FullAccess** (fine for a lab; in a real job you would scope them tighter).
-3. Open the user → **Security credentials → Create access key → Command Line Interface**. Save the *Access key ID* and *Secret access key*.
+- Docker Desktop (or Docker Engine on Linux)
+- An AWS account, a Docker Hub account (free)
+- Terraform and Ansible, only for the manual run (the Jenkins image already includes them)
+- minikube and kubectl, for the Kubernetes part
 
-### 1.2 Set a budget alarm (2 minutes, highly recommended)
-
-AWS Console → **Billing → Budgets → Create budget → Zero spend budget** (or a $1 monthly budget). AWS emails you as soon as anything costs money.
-
-### 1.3 Create an SSH key for the server
+> **Windows:** use WSL2 (Ubuntu). Ansible does not run natively on Windows.
 
 ```bash
-ssh-keygen -t ed25519 -f ~/.ssh/iac-lab -N ""
-# creates ~/.ssh/iac-lab (private, keep secret) and ~/.ssh/iac-lab.pub (public)
-```
-
-### 1.4 Create a Docker Hub access token
-
-Docker Hub → **Account settings → Personal access tokens → Generate** (Read & Write). Save the token.
-
-### 1.5 Push this project to your GitHub
-
-Create an **empty** repo on GitHub named `iac-lab` (no README, no .gitignore), then:
-
-```bash
+git clone https://github.com/Dinesh16680-M/iac-lab.git
 cd iac-lab
-git init
-git add .
-git commit -m "Infrastructure as Code Lab: Terraform, Ansible, Jenkins, Trivy, Kubernetes"
-git branch -M main
-git remote add origin https://github.com/<YOUR_GITHUB_USER>/iac-lab.git
-git push -u origin main
 ```
 
-Before every commit, check that `git status` shows **no** `terraform.tfvars`, `*.tfstate` or key files. The `.gitignore` already excludes them.
+### One-time setup
 
----
+1. **AWS user:** in IAM, create a user `iac-lab` with `AmazonEC2FullAccess` and `AmazonS3FullAccess`, then create an access key for CLI use. Don't use the root account.
+2. **Budget alarm:** Billing → Budgets → *Zero spend budget*, so AWS emails you if anything starts costing money.
+3. **SSH key:**
+   ```bash
+   ssh-keygen -t ed25519 -f ~/.ssh/iac-lab -N ""
+   ```
+4. **Docker Hub token:** Account settings → Personal access tokens → Generate (Read & Write).
 
-## Part A: run it by hand first (recommended, to understand each step)
+### Option A: run each step by hand
 
-### A1. Build and test the app locally
-
-```bash
-cd app
-docker build -t iac-lab-app:local .
-docker run --rm -p 8080:8080 iac-lab-app:local
-# open http://localhost:8080 and http://localhost:8080/health, then Ctrl+C
-```
-
-Scan it with Trivy, the same way the pipeline does:
+**1. Build, run and scan the app locally**
 
 ```bash
+docker build -t iac-lab-app:local app
+docker run --rm -p 8080:8080 iac-lab-app:local          # http://localhost:8080
 docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
   aquasec/trivy:0.65.0 image --severity HIGH,CRITICAL iac-lab-app:local
 ```
 
-### A2. Create the AWS infrastructure with Terraform
+**2. Create the infrastructure**
 
 ```bash
-export AWS_ACCESS_KEY_ID=...        # from step 1.1
+export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
 
 cd terraform
 cp terraform.tfvars.example terraform.tfvars
-# edit terraform.tfvars:
-#   allowed_ssh_cidr = "<output of: curl -s https://checkip.amazonaws.com>/32"
-#   ssh_public_key   = "<contents of ~/.ssh/iac-lab.pub>"
-
-terraform init      # downloads the AWS provider
-terraform plan      # shows what will be created (5-8 resources), changes nothing
-terraform apply     # type "yes"
+# set allowed_ssh_cidr to "<your IP>/32" (curl -s https://checkip.amazonaws.com)
+# set ssh_public_key to the contents of ~/.ssh/iac-lab.pub
+terraform init
+terraform plan
+terraform apply
 ```
 
-At the end Terraform prints `server_public_ip`, `app_url`, `ssh_command` and the bucket name. It also writes `ansible/inventory.ini` with the server's IP.
+Terraform prints the server IP, the app URL and an SSH command, and writes `ansible/inventory.ini`.
 
-### A3. Configure the server and deploy with Ansible
-
-Push your image to Docker Hub first so the server can pull it:
+**3. Push the image and deploy with Ansible**
 
 ```bash
 docker login
-# --platform linux/amd64 because the EC2 server is x86 (matters on Apple Silicon Macs)
-docker build --platform linux/amd64 -t <DOCKERHUB_USER>/iac-lab-app:latest ../app
+docker build --platform linux/amd64 -t <DOCKERHUB_USER>/iac-lab-app:latest app
 docker push <DOCKERHUB_USER>/iac-lab-app:latest
-```
 
-Then:
-
-```bash
-cd ../ansible
+cd ansible
 ansible-galaxy collection install -r requirements.yml
-ansible web -m ping                           # should answer "pong"
+ansible web -m ping
 ansible-playbook install-docker.yml
 ansible-playbook deploy-app.yml -e app_image=<DOCKERHUB_USER>/iac-lab-app:latest
 ```
 
-Open the `app_url` from Terraform in your browser. 🎉
+Open the `app_url` from the Terraform output.
 
-### A4. Tear it down
+**4. Tear down**
 
 ```bash
-cd ../terraform
-terraform destroy   # type "yes"
+cd terraform && terraform destroy
 ```
 
----
+### Option B: the full Jenkins pipeline
 
-## Part B: the full Jenkins pipeline
-
-### B1. Start Jenkins
+**1. Start Jenkins**
 
 ```bash
 cd jenkins
-docker compose up -d --build        # first build takes a few minutes
+docker compose up -d --build
 docker exec iac-lab-jenkins cat /var/jenkins_home/secrets/initialAdminPassword
 ```
 
-Open http://localhost:8080, paste the password, choose **Install suggested plugins**, create your admin user.
+Open http://localhost:8080, paste the password, install the suggested plugins and create an admin user.
 
-### B2. Add three credentials
+**2. Add credentials** (Manage Jenkins → Credentials → Global)
 
-**Manage Jenkins → Credentials → System → Global credentials → Add credentials**
-
-| ID (type exactly) | Kind | Values |
+| ID | Kind | Value |
 |---|---|---|
-| `aws-creds` | Username with password | Username = AWS access key ID, Password = secret access key |
-| `dockerhub-creds` | Username with password | Username = Docker Hub user, Password = access token |
-| `ec2-ssh-key` | SSH Username with private key | Username = `ubuntu`, Private key → Enter directly → paste the contents of `~/.ssh/iac-lab` |
+| `aws-creds` | Username with password | access key ID / secret access key |
+| `dockerhub-creds` | Username with password | Docker Hub user / access token |
+| `ec2-ssh-key` | SSH Username with private key | user `ubuntu`, contents of `~/.ssh/iac-lab` |
 
-### B3. Create the pipeline job
+**3. Create the job**
 
-1. **New Item** → name `iac-lab` → **Pipeline** → OK.
-2. Under **Pipeline**: Definition = *Pipeline script from SCM*, SCM = *Git*, Repository URL = `https://github.com/<YOUR_GITHUB_USER>/iac-lab.git`, Branch = `*/main`, Script Path = `Jenkinsfile`.
-3. Save → **Build Now** once (this first run only loads the parameters and may fail, that's normal).
-4. **Build with Parameters** → ACTION = `deploy`, DOCKERHUB_USER = your Docker Hub user → **Build**.
+New Item → *Pipeline* → Pipeline script from SCM → Git → `https://github.com/Dinesh16680-M/iac-lab.git`, branch `*/main`, script path `Jenkinsfile`.
 
-Watch the stages in the Stage View. The last stage prints the URL of your app.
+Run **Build Now** once so Jenkins loads the parameters (this first run may fail), then **Build with Parameters** with `ACTION=deploy` and your Docker Hub user. The last stage prints the app URL.
 
-**Try the security gate:** change the first line of `app/Dockerfile` to an old image, e.g. `FROM python:3.8-slim-buster`, push, and build again. Trivy should find CRITICAL vulnerabilities and stop the pipeline before anything is deployed. Change it back afterwards.
+To delete everything on AWS, run it again with `ACTION=destroy`.
 
-**Try a change:** edit the `<h1>` text in `app/app.py`, push, build again. The new version (build number) appears on the page without any manual step.
+> Terraform state lives in the Jenkins workspace (the `jenkins_home` volume). Run `destroy` before deleting the job or the volume.
 
-### B4. Destroy from Jenkins
+**Try it out**
 
-**Build with Parameters** → ACTION = `destroy`. This deletes the EC2 server, security group, key pair and S3 bucket.
+- Change the `<h1>` in `app/app.py`, push and rebuild: the new build number appears on the page.
+- Change the base image to `python:3.8-slim-buster`, push and rebuild: Trivy finds critical vulnerabilities and the pipeline stops before deploying.
 
-> Terraform keeps its state file in the Jenkins workspace (inside the `jenkins_home` Docker volume). Don't delete that volume or the job before you've run `destroy`, otherwise Terraform no longer knows what it created (you would then delete the resources by hand in the AWS Console; they all have the tag `Project = iac-lab`).
-
----
-
-## Part C: Kubernetes on minikube (local, free)
+### Option C: Kubernetes on minikube
 
 ```bash
 minikube start
-
-# build the image directly inside minikube, so no registry is needed
 minikube image build -t iac-lab-app:local app
-
 kubectl apply -f k8s/
-kubectl get pods -w              # wait until both pods are Running and READY 1/1 (Ctrl+C)
-minikube service iac-lab-app     # opens the app in your browser
+kubectl get pods
+minikube service iac-lab-app
 ```
 
-Things to try:
+Scale it, delete a pod and watch Kubernetes replace it:
 
 ```bash
 kubectl scale deployment iac-lab-app --replicas=4
-kubectl get pods -o wide
-kubectl delete pod <one-pod-name>      # Kubernetes starts a new one automatically
-kubectl logs deployment/iac-lab-app
+kubectl delete pod <pod-name>
 ```
 
-Refresh the page a few times: "Served by" changes because the Service balances across pods.
-
-Clean up: `kubectl delete -f k8s/` and `minikube stop` (or `minikube delete`).
+Clean up with `kubectl delete -f k8s/` and `minikube stop`.
 
 ---
 
-## Costs and cleanup
+## Cost and cleanup
 
-| Resource | Free tier | Without free tier (approx.) |
-|---|---|---|
-| EC2 `t3.micro` | Included in the AWS free tier* | ~$0.01 / hour |
-| Public IPv4 address | Included while attached to a free-tier instance* | ~$0.005 / hour |
-| EBS disk 8 GB gp3 | 30 GB included | ~$0.70 / month |
-| S3 bucket | 5 GB included | almost nothing (it stays empty) |
-| Data transfer | 100 GB/month out included | – |
+Everything is sized for the AWS free tier: one `t3.micro` instance, an 8 GB gp3 disk and an empty S3 bucket in `eu-central-1`. Without free tier it costs roughly $0.015 per hour while running. Since July 2025 new AWS accounts get a credit-based free plan instead of the 12-month free tier, so check yours under Billing → Free tier.
 
-\* AWS changed its free tier in July 2025: new accounts get credits (up to $200) on a free plan instead of the old 12-month model. Either way, running this lab for a few hours costs cents at most. Check your plan under **Billing → Free tier**.
-
-**Rules to stay at $0:**
-
-1. Always run `terraform destroy` (or the Jenkins `destroy` build) when you're done for the day.
-2. Set the budget alarm from step 1.2.
-3. Afterwards check the AWS Console in your region (default **eu-central-1 / Frankfurt**): EC2 → Instances should show none running, and no leftover Elastic IPs or volumes.
-4. Don't change `instance_type` to something bigger.
-
----
+- Always run `terraform destroy` (or the `destroy` build) when you're done.
+- Keep the budget alarm on.
+- All resources are tagged `Project = iac-lab`, so leftovers are easy to find in the console.
 
 ## Troubleshooting
 
 | Problem | Fix |
 |---|---|
-| `ansible ... UNREACHABLE` / SSH timeout | Your IP changed. Update `allowed_ssh_cidr` and run `terraform apply` again (Jenkins does this automatically). |
-| `Permission denied (publickey)` | The key in `terraform.tfvars` / Jenkins doesn't match `~/.ssh/iac-lab`. Check `chmod 600 ~/.ssh/iac-lab`. |
-| `InvalidAMIID` or `Unsupported instance type` | Some regions use `t2.micro` for the free tier. Set `instance_type = "t2.micro"`. |
-| Trivy stage fails | It works as intended: read the CVE list, update the base image or the package version in `requirements.txt`. |
-| `exec format error` on the server | The image was built for ARM (Apple Silicon). The pipeline builds with `--platform linux/amd64`; do the same when building by hand. |
-| `permission denied ... docker.sock` in Jenkins | Make sure you started Jenkins with the provided `docker-compose.yml`. |
-| minikube pod `ErrImageNeverPull` | Run `minikube image build -t iac-lab-app:local app` again. |
+| Ansible `UNREACHABLE` / SSH timeout | Your IP changed. Update `allowed_ssh_cidr` and run `terraform apply` again (Jenkins does this automatically). |
+| `Permission denied (publickey)` | The public key in Terraform doesn't match `~/.ssh/iac-lab`; run `chmod 600 ~/.ssh/iac-lab`. |
+| `Unsupported instance type` | Some regions use `t2.micro` for the free tier; set `instance_type = "t2.micro"`. |
+| `exec format error` on the server | The image was built for ARM; build with `--platform linux/amd64`. |
+| Trivy stage fails | Working as intended: update the base image or the package versions in `requirements.txt`. |
+| minikube `ErrImageNeverPull` | Run `minikube image build -t iac-lab-app:local app` again. |
 
----
+## Roadmap
 
-## What I'd add next
-
-- Store the Terraform state in an S3 backend with locking instead of the Jenkins workspace.
-- Push images to Amazon ECR instead of Docker Hub.
-- Use a GitHub webhook so every push starts the pipeline automatically.
-- Deploy to a managed Kubernetes cluster (EKS) with the same manifests.
+- Remote Terraform state in S3 with locking
+- Amazon ECR instead of Docker Hub
+- GitHub webhook to trigger the pipeline on every push
+- Deploy the Kubernetes manifests to Amazon EKS
