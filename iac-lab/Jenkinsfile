@@ -1,0 +1,151 @@
+// CI/CD pipeline for the Infrastructure as Code Lab
+// test -> build image -> Trivy scan -> push -> Terraform -> Ansible -> smoke test
+//
+// Jenkins credentials this pipeline expects (Manage Jenkins > Credentials):
+//   aws-creds        Username with password  (username = AWS access key ID, password = secret access key)
+//   dockerhub-creds  Username with password  (Docker Hub username + access token)
+//   ec2-ssh-key      SSH Username with private key (username "ubuntu", the private key ~/.ssh/iac-lab)
+
+pipeline {
+    agent any
+
+    parameters {
+        choice(name: 'ACTION', choices: ['deploy', 'destroy'],
+               description: 'deploy = build and ship the app, destroy = delete everything on AWS')
+        string(name: 'DOCKERHUB_USER', defaultValue: 'CHANGE_ME',
+               description: 'Your Docker Hub username')
+    }
+
+    environment {
+        IMAGE_NAME = "${params.DOCKERHUB_USER}/iac-lab-app"
+        IMAGE_TAG  = "${env.BUILD_NUMBER}"
+        TF_IN_AUTOMATION = 'true'
+    }
+
+    options {
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds() // two runs must never change the same Terraform state at once
+    }
+
+    stages {
+        stage('Unit tests') {
+            when { expression { params.ACTION == 'deploy' } }
+            steps {
+                dir('app') {
+                    sh 'python3 -m pytest -q'
+                }
+            }
+        }
+
+        stage('Build image') {
+            when { expression { params.ACTION == 'deploy' } }
+            steps {
+                // linux/amd64 because the EC2 server is x86, even if your laptop is an Apple Silicon Mac
+                sh '''
+                    docker build --platform linux/amd64 \
+                      --build-arg APP_VERSION=${IMAGE_TAG} \
+                      -t ${IMAGE_NAME}:${IMAGE_TAG} -t ${IMAGE_NAME}:latest app
+                '''
+            }
+        }
+
+        stage('Security scan (Trivy)') {
+            when { expression { params.ACTION == 'deploy' } }
+            steps {
+                // --exit-code 1 fails the build when a CRITICAL vulnerability with a fix is found,
+                // so an insecure image never reaches the server.
+                sh '''
+                    docker run --rm \
+                      -v /var/run/docker.sock:/var/run/docker.sock \
+                      -v trivy-cache:/root/.cache/ \
+                      aquasec/trivy:0.65.0 image \
+                      --severity CRITICAL --ignore-unfixed --exit-code 1 --no-progress \
+                      ${IMAGE_NAME}:${IMAGE_TAG}
+                '''
+            }
+        }
+
+        stage('Push image') {
+            when { expression { params.ACTION == 'deploy' } }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'dockerhub-creds',
+                                                  usernameVariable: 'DH_USER', passwordVariable: 'DH_TOKEN')]) {
+                    sh '''
+                        echo "$DH_TOKEN" | docker login -u "$DH_USER" --password-stdin
+                        docker push ${IMAGE_NAME}:${IMAGE_TAG}
+                        docker push ${IMAGE_NAME}:latest
+                        docker logout
+                    '''
+                }
+            }
+        }
+
+        stage('Terraform') {
+            steps {
+                withCredentials([
+                    usernamePassword(credentialsId: 'aws-creds',
+                                     usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY'),
+                    sshUserPrivateKey(credentialsId: 'ec2-ssh-key', keyFileVariable: 'SSH_KEY')
+                ]) {
+                    dir('terraform') {
+                        sh '''
+                            export TF_VAR_ssh_public_key="$(ssh-keygen -y -f "$SSH_KEY")"
+                            export TF_VAR_allowed_ssh_cidr="$(curl -fsS https://checkip.amazonaws.com)/32"
+
+                            terraform init -input=false
+                            if [ "$ACTION" = "destroy" ]; then
+                                terraform destroy -auto-approve -input=false
+                            else
+                                terraform apply -auto-approve -input=false
+                            fi
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Ansible: install Docker') {
+            when { expression { params.ACTION == 'deploy' } }
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: 'ec2-ssh-key', keyFileVariable: 'SSH_KEY')]) {
+                    dir('ansible') {
+                        sh 'ansible-playbook --private-key "$SSH_KEY" install-docker.yml'
+                    }
+                }
+            }
+        }
+
+        stage('Ansible: deploy app') {
+            when { expression { params.ACTION == 'deploy' } }
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: 'ec2-ssh-key', keyFileVariable: 'SSH_KEY')]) {
+                    dir('ansible') {
+                        sh 'ansible-playbook --private-key "$SSH_KEY" deploy-app.yml -e app_image=${IMAGE_NAME}:${IMAGE_TAG}'
+                    }
+                }
+            }
+        }
+
+        stage('Smoke test') {
+            when { expression { params.ACTION == 'deploy' } }
+            steps {
+                dir('terraform') {
+                    sh '''
+                        URL="$(terraform output -raw app_url)"
+                        curl -fsS --retry 5 --retry-delay 3 "$URL/health"
+                        echo ""
+                        echo "App is live at: $URL"
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            // keep the laptop's disk from filling up with old images
+            sh 'docker image prune -f || true'
+        }
+    }
+}

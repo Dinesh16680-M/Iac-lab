@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iac-lab-app
+  labels:
+    app: iac-lab-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: iac-lab-app
+  template:
+    metadata:
+      labels:
+        app: iac-lab-app
+    spec:
+      containers:
+        - name: app
+          # Built locally and loaded into minikube (see README), so no registry is needed
+          image: iac-lab-app:local
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8080
+          env:
+            - name: APP_VERSION
+              value: "minikube"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10

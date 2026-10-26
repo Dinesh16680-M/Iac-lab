@@ -1,0 +1,35 @@
+# Prepares a fresh Ubuntu server: updates packages and installs Docker.
+# Run: ansible-playbook install-docker.yml
+- name: Install Docker on the web server
+  hosts: web
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Wait until the new server accepts SSH (can take a minute after Terraform)
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    - name: Gather facts now that the server is reachable
+      ansible.builtin.setup:
+
+    - name: Install Docker and the Python library Ansible needs to control it
+      ansible.builtin.apt:
+        name:
+          - docker.io
+          - python3-docker
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Make sure Docker is running and starts after a reboot
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Let the ubuntu user run docker without sudo
+      ansible.builtin.user:
+        name: ubuntu
+        groups: docker
+        append: true

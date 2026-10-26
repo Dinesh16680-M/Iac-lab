@@ -1,0 +1,18 @@
+# Starts Jenkins on http://localhost:8080
+# Run from this folder: docker compose up -d --build
+services:
+  jenkins:
+    build: .
+    container_name: iac-lab-jenkins
+    # root keeps the lab simple: Jenkins can use the Docker socket on every OS.
+    # Fine for a local learning setup, not for a shared or production Jenkins.
+    user: root
+    ports:
+      - "8080:8080"
+    volumes:
+      - jenkins_home:/var/jenkins_home          # jobs, credentials and Terraform state survive restarts
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+volumes:
+  jenkins_home:

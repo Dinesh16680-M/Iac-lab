@@ -1,0 +1,34 @@
+# Pulls the app image from Docker Hub and (re)starts the container on port 80.
+# Run: ansible-playbook deploy-app.yml -e app_image=YOUR_DOCKERHUB_USER/iac-lab-app:latest
+- name: Deploy the app container
+  hosts: web
+  become: true
+
+  vars:
+    app_image: "CHANGE_ME/iac-lab-app:latest"
+    container_name: iac-lab-app
+
+  tasks:
+    - name: Pull the newest version of the image
+      community.docker.docker_image:
+        name: "{{ app_image }}"
+        source: pull
+        force_source: true
+
+    - name: Run the container (replaced if the image changed)
+      community.docker.docker_container:
+        name: "{{ container_name }}"
+        image: "{{ app_image }}"
+        state: started
+        restart_policy: unless-stopped
+        published_ports:
+          - "80:8080"
+
+    - name: Check that the app answers on /health
+      ansible.builtin.uri:
+        url: "http://localhost/health"
+        status_code: 200
+      register: health
+      retries: 10
+      delay: 3
+      until: health.status == 200
