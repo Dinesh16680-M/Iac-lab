@@ -1,6 +1,6 @@
 # Infrastructure as Code Lab on AWS
 
-> This README was generated with [Claude] as per my command.
+
 
 An end-to-end DevOps project that builds AWS infrastructure from code, configures it automatically and deploys a containerized web app through a CI/CD pipeline with a security gate. The whole environment can be created and torn down with one pipeline run.
 
